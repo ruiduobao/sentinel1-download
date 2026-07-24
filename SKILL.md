@@ -7,7 +7,7 @@ license: MIT-0
 description: |
   通过 STAC 搜索和下载 Sentinel-1 SAR (C 波段) 影像。
   默认后端是 Microsoft Planetary Computer（公开数据，无需账号）。
-  支持极化方式过滤（VV/VH/VV+VH）、轨道方向过滤（ascending/descending）、
+  支持极化方式过滤（VV/VH/VV+VH / lowercase: vv/vh/vv+vh/all）、轨道方向过滤（ascending/descending）、
   安全的 .part 临时文件写入以及可视化下载进度。
   Use for Sentinel-1 SAR imagery search by bounding box / date / polarization,
   orbit direction, and large-file downloads with visual progress.
@@ -54,14 +54,14 @@ python sentinel1-download.py \
     --end-date 2024-12-31
 ```
 
-### 限制极化方式（推荐 VV+VH 双极化）
+### 限制极化方式（推荐 vv+vh 双极化，注意小写）
 
 ```bash
 python sentinel1-download.py \
     --bbox 116.0 39.0 117.0 40.0 \
     --start-date 2024-01-01 \
     --end-date 2024-12-31 \
-    --polarization VV+VH
+    --polarization vv+vh
 ```
 
 ### 搜索 + 下载
