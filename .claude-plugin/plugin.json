@@ -1,0 +1,1 @@
+{"author":{"name":"ruiduobao"},"description":"STAC-based Sentinel-1 SAR (C-band) imagery downloader with polarization and orbit direction filtering","name":"sentinel1-download","version":"0.1.1"}
