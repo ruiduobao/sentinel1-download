@@ -1,23 +1,27 @@
 ---
-name: sentinel1-download
-display_name: Sentinel-1 SAR Downloader
-version: 0.1.0
-author: rui.duobao
-license: MIT-0
-description: |
-  通过 STAC 搜索和下载 Sentinel-1 SAR (C 波段) 影像。
+description: '通过 STAC 搜索和下载 Sentinel-1 SAR (C 波段) 影像。
+
   默认后端是 Microsoft Planetary Computer（公开数据，无需账号）。
+
   支持极化方式过滤（VV/VH/VV+VH / lowercase: vv/vh/vv+vh/all）、轨道方向过滤（ascending/descending）、
+
   安全的 .part 临时文件写入以及可视化下载进度。
+
   Use for Sentinel-1 SAR imagery search by bounding box / date / polarization,
+
   orbit direction, and large-file downloads with visual progress.
 
+
   English: STAC-based Sentinel-1 SAR (C-band) downloader.
+
   Data source: Microsoft Planetary Computer (Sentinel-1 GRD, public domain).
+
   Supports polarization filter, orbit direction filter, safe .part temp writes,
+
   and visual progress (speed + ETA).
-runtime: python>=3.9
-tags: [gis, remote-sensing, sar, sentinel-1, stac, planetary-computer, earth-observation, 下载]
+
+  '
+name: sentinel1-download
 ---
 
 # Sentinel-1 SAR Downloader | Sentinel-1 SAR 影像下载器

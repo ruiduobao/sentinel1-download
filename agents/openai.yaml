@@ -1,0 +1,3 @@
+description: 通过 STAC 搜索和下载 Sentinel-1 SAR (C 波段) 影像。
+display_name: Sentinel1 Download
+name: sentinel1-download
