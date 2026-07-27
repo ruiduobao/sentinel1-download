@@ -18,6 +18,7 @@ MIT-0. Sentinel-1 data © ESA Copernicus (free and open).
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import sys
@@ -25,6 +26,13 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
+
+# Local helper: --place resolution (vendored copy of _place_resolver.py)
+try:
+    from _place import resolve_place as _resolve_place
+except ImportError:  # pragma: no cover
+    def _resolve_place(*_a, **_kw):  # type: ignore
+        raise RuntimeError("place resolution helper (_place.py) not available in this folder")
 
 # ---------------------------------------------------------------------------
 # STAC endpoints
@@ -52,9 +60,90 @@ BAND_DESCRIPTIONS: Dict[str, Tuple[str, str]] = {
     "vv": ("VV polarization (co-pol)", "VV 极化（共极化）"),
 }
 
-USER_AGENT = "sentinel1-download/0.1.0 (+https://clawhub.ai/skills/sentinel1-download)"
+USER_AGENT = "sentinel1-download/0.2.0 (+https://clawhub.ai/skills/sentinel1-download)"
 
 DEFAULT_TRUST_ENV = os.environ.get("SENTINEL1_DOWNLOAD_USE_PROXY") == "1"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Presets + 自然语言日期展开（镜像 landsat-download v0.2.0）
+# ─────────────────────────────────────────────────────────────────────────────
+
+PRESETS: Dict[str, Dict[str, Any]] = {
+    "annual-2024": {
+        "description": "2024 全年 Sentinel-1 GRD / full year 2024",
+        "start_date": "2024-01-01", "end_date": "2024-12-31",
+    },
+    "flood-2024": {
+        "description": "2024 汛期 (6-9 月) / flood season",
+        "start_date": "2024-06-01", "end_date": "2024-09-30",
+    },
+    "winter-2024": {
+        "description": "2024 冬季 (12-2 月 跨年) / winter 2024",
+        "start_date": "2023-12-01", "end_date": "2024-02-29",
+    },
+}
+
+SEASON_MONTHS: Dict[str, Tuple[int, int]] = {
+    "spring": (3, 5), "summer": (6, 8), "autumn": (9, 11),
+    "fall": (9, 11), "winter": (12, 2),
+}
+
+
+def _auto_buffer_for_place(place_name: str) -> float:
+    """Heuristic auto buffer (degrees) — same logic as landsat-download."""
+    if not place_name:
+        return 0.3
+    name = place_name.strip()
+    if name.endswith(("省", "自治区")) or "省" in name[-3:]:
+        return 5.0
+    if name.endswith("市"):
+        return 0.6
+    if name.endswith("区"):
+        return 0.15
+    if name.endswith(("县", "旗")):
+        return 0.4
+    return 0.3
+
+
+def apply_preset(args: argparse.Namespace) -> argparse.Namespace:
+    """Apply --preset / --year / --season to fill in start/end dates."""
+    if not (args.preset or args.season or args.year):
+        return args
+    today = time.strftime("%Y-%m-%d")
+
+    if args.preset:
+        if args.preset not in PRESETS:
+            valid = ", ".join(sorted(PRESETS.keys()))
+            raise SystemExit(f"ERROR: --preset must be one of: {valid}")
+        spec = PRESETS[args.preset]
+        if not args.start_date:
+            args.start_date = spec.get("start_date")
+        if not args.end_date:
+            args.end_date = spec.get("end_date") or today
+
+    if args.season and args.year and not args.start_date:
+        s = args.season.lower()
+        if s not in SEASON_MONTHS:
+            raise SystemExit(f"ERROR: --season must be one of: {', '.join(sorted(SEASON_MONTHS.keys()))}")
+        m1, m2 = SEASON_MONTHS[s]
+        y = args.year
+        if m1 <= m2:
+            args.start_date = f"{y}-{m1:02d}-01"
+            import calendar
+            last_day = calendar.monthrange(y, m2)[1]
+            args.end_date = f"{y}-{m2:02d}-{last_day}"
+        else:
+            args.start_date = f"{y}-{m1:02d}-01"
+            import calendar
+            last_day = calendar.monthrange(y + 1, m2)[1]
+            args.end_date = f"{y + 1}-{m2:02d}-{last_day}"
+
+    if args.year and not args.start_date:
+        y = args.year
+        args.start_date = f"{y}-01-01"
+        args.end_date = f"{y}-12-31"
+
+    return args
 
 _SAS_CACHE: Dict[str, Tuple[str, float]] = {}
 
@@ -221,6 +310,65 @@ def format_results_json(query_meta: Dict[str, Any], features: List[Dict[str, Any
     )
 
 
+def format_results_csv(query_meta: Dict[str, Any], features: List[Dict[str, Any]]) -> str:
+    """Return a CSV string of the search results (header + one row per scene)."""
+    import io
+    buf = io.StringIO()
+    fieldnames = [
+        "id", "datetime", "platform", "constellation", "instrument",
+        "orbit_state", "polarizations", "product_type",
+        "bbox_min_lon", "bbox_min_lat", "bbox_max_lon", "bbox_max_lat",
+        "assets",
+    ]
+    writer = csv.DictWriter(buf, fieldnames=fieldnames)
+    writer.writeheader()
+    for f in features:
+        props = f.get("properties", {}) or {}
+        bbox = f.get("bbox") or [None, None, None, None]
+        pols = props.get("sar:polarizations") or props.get("polarizations") or []
+        if isinstance(pols, list):
+            pols_str = "|".join(str(p) for p in pols)
+        else:
+            pols_str = str(pols)
+        writer.writerow({
+            "id": f.get("id", ""),
+            "datetime": props.get("datetime", ""),
+            "platform": props.get("platform", ""),
+            "constellation": props.get("constellation", ""),
+            "instrument": props.get("instruments", "") or props.get("instrument", ""),
+            "orbit_state": props.get("sat:orbit_state", ""),
+            "polarizations": pols_str,
+            "product_type": props.get("sar:product_type", ""),
+            "bbox_min_lon": bbox[0] if len(bbox) > 0 else "",
+            "bbox_min_lat": bbox[1] if len(bbox) > 1 else "",
+            "bbox_max_lon": bbox[2] if len(bbox) > 2 else "",
+            "bbox_max_lat": bbox[3] if len(bbox) > 3 else "",
+            "assets": "|".join((f.get("assets") or {}).keys()),
+        })
+    return buf.getvalue()
+
+
+def write_metadata_file(
+    fmt: str,
+    output_path: str,
+    query_meta: Dict[str, Any],
+    features: List[Dict[str, Any]],
+) -> str:
+    """Write search-result metadata to ``output_path`` as csv or json.
+
+    Returns the path actually written.
+    """
+    if fmt == "json":
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(format_results_json(query_meta, features))
+    elif fmt == "csv":
+        with open(output_path, "w", encoding="utf-8", newline="") as f:
+            f.write(format_results_csv(query_meta, features))
+    else:
+        raise ValueError(f"Unsupported --format value: {fmt!r}")
+    return output_path
+
+
 # ---------------------------------------------------------------------------
 # Download with progress
 # ---------------------------------------------------------------------------
@@ -357,18 +505,89 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--download", action="store_true", help="Trigger actual download")
     p.add_argument("--output-dir", default="./sentinel1_data", help="Download directory")
     p.add_argument("--output-format", default="text", choices=["text", "json"], help="Output format")
+    p.add_argument(
+        "--format",
+        choices=["csv", "json"],
+        default=None,
+        help="Also write the search-result metadata to a side file as CSV or JSON. "
+             "Path is controlled by --format-output (default: ./sentinel1_metadata.<ext>).",
+    )
+    p.add_argument(
+        "--format-output",
+        default="./sentinel1_metadata",
+        help="Path (without extension) for the --format side file. Extension is added automatically.",
+    )
     p.add_argument("--source", default="pc", choices=["pc", "aws"], help="STAC backend")
     p.add_argument("--no-progress", action="store_true", help="Disable progress bar")
     p.add_argument("--download-timeout", type=int, default=600, help="Per-asset timeout seconds")
     p.add_argument("--quiet", action="store_true", help="Suppress progress + privacy notice")
+    p.add_argument(
+        "--place",
+        help="Place name (Chinese or English). Auto-resolved to bbox via Open-Meteo + Nominatim. "
+             "Mutually exclusive with --bbox / 行政地名 (自动解析为 bbox)",
+    )
+    p.add_argument(
+        "--place-buffer-deg",
+        type=float,
+        default=0.1,
+        help="Buffer (degrees) added around the resolved point when --place is used "
+             "(default 0.1; ignored if --bbox also given)",
+    )
+    p.add_argument(
+        "--no-nominatim",
+        action="store_true",
+        help="Skip Nominatim lookup in --place resolution",
+    )
+    p.add_argument(
+        "--qa",
+        metavar="PATH",
+        help="Write a JSON QA summary to PATH. Implies --download.",
+    )
+    p.add_argument(
+        "--preset",
+        choices=sorted(PRESETS.keys()),
+        help="One-line preset (auto-fills start/end). "
+             f"Available: {', '.join(sorted(PRESETS.keys()))}.",
+    )
+    p.add_argument(
+        "--year",
+        type=int,
+        help="Shortcut: --year 2024 → --start-date 2024-01-01 --end-date 2024-12-31.",
+    )
+    p.add_argument(
+        "--season",
+        choices=sorted(SEASON_MONTHS.keys()),
+        help="Northern-Hemisphere season (需配合 --year). e.g. --year 2024 --season summer.",
+    )
+    p.add_argument(
+        "--pick-best",
+        action="store_true",
+        help="Only download the scene with the lowest cloud cover. SAR is cloud-independent, "
+             "but useful to pick the most-recent scene. / 仅下载最新或最优一景",
+    )
+    p.add_argument(
+        "--qa-mode",
+        choices=["search", "full"],
+        default="full",
+        help="What to write to --qa. 'search' = search meta only (no download). Default: full.",
+    )
     return p
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
 
+    # Apply --preset / --year / --season BEFORE required-arg check
+    try:
+        args = apply_preset(args)
+    except SystemExit:
+        raise
+    except Exception as e:
+        print(f"ERROR: --preset expansion failed: {e}", file=sys.stderr)
+        return 2
+
     missing = []
-    if not args.bbox: missing.append("--bbox")
+    if not args.bbox and not args.place: missing.append("--bbox or --place")
     if not args.start_date: missing.append("--start-date")
     if not args.end_date: missing.append("--end-date")
     if missing:
@@ -377,6 +596,33 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.quiet:
         os.environ["SENTINEL1_DOWNLOAD_QUIET"] = "1"
+
+    # Resolve --place to bbox if given
+    place_info: Optional[Dict[str, Any]] = None
+    if args.place:
+        if args.bbox:
+            print("ERROR: --place and --bbox are mutually exclusive; pick one.", file=sys.stderr)
+            return 2
+        try:
+            place_info = _resolve_place(args.place, allow_nominatim=not args.no_nominatim)
+        except Exception as e:
+            print(f"ERROR: --place resolution failed: {e}", file=sys.stderr)
+            return 2
+        # Auto buffer by admin-level heuristic
+        buf = args.place_buffer_deg if args.place_buffer_deg != 0.1 else _auto_buffer_for_place(args.place)
+        w = place_info["lon"] - buf
+        e = place_info["lon"] + buf
+        s = place_info["lat"] - buf
+        n = place_info["lat"] + buf
+        args.bbox = [w, s, e, n]
+        place_info["buffer_deg_used"] = buf
+        if not _quiet():
+            print(f"[sentinel1-download] place: {place_info.get('display_name') or args.place}", file=sys.stderr)
+            print(f"[sentinel1-download] resolved to bbox {args.bbox} (buffer {buf}°)", file=sys.stderr)
+            print(f"[sentinel1-download] geocoder source: {place_info.get('source')}", file=sys.stderr)
+
+    if args.qa and args.qa_mode == "full":
+        args.download = True
 
     bbox = tuple(args.bbox)
     query_meta = {
@@ -407,6 +653,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     features = resp.get("features", [])
     query_meta["returned"] = len(features)
 
+    # --pick-best: SAR 无云量概念，按 datetime 倒序取最新一景
+    picked = None
+    if args.pick_best and features:
+        features = sorted(features, key=lambda f: f.get("properties", {}).get("datetime", ""), reverse=True)
+        best = features[0]
+        dt = best.get("properties", {}).get("datetime", "?")
+        picked = {"id": best.get("id"), "datetime": dt}
+        features = [best]
+        if not _quiet():
+            print(f"[sentinel1-download] --pick-best: chose 1 scene (datetime={dt})", file=sys.stderr)
+        query_meta["picked"] = picked
+
     if args.output_format == "json":
         print(format_results_json(query_meta, features))
     else:
@@ -417,6 +675,25 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"[sentinel1-download] bbox: [{bbox[0]}, {bbox[1]}, {bbox[2]}, {bbox[3]}]", file=sys.stderr)
             print(f"[sentinel1-download] date: {args.start_date} → {args.end_date}", file=sys.stderr)
         print(format_results_text(query_meta, features))
+
+    # Side-file metadata export (--format csv|json). Independent of --output-format.
+    if args.format:
+        ext = ".json" if args.format == "json" else ".csv"
+        side_path = args.format_output + ext
+        try:
+            written = write_metadata_file(args.format, side_path, query_meta, features)
+            if not _quiet():
+                print(f"[sentinel1-download] wrote metadata to {written}", file=sys.stderr)
+        except Exception as e:
+            print(f"ERROR: --format write failed: {e}", file=sys.stderr)
+            return 3
+
+    # search-only QA: write QA even when not downloading
+    if args.qa and args.qa_mode == "search" and not args.download:
+        _write_qa(args, query_meta, features, place_info, total_bytes=0, elapsed=0.0)
+        if not _quiet():
+            print(f"[sentinel1-download] wrote search-only QA to {args.qa}", file=sys.stderr)
+        return 0
 
     if not args.download:
         if not _quiet():
@@ -450,7 +727,66 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not _quiet():
         print(f"\n[sentinel1-download] done in {elapsed:.0f}s — "
               f"downloaded {_human_bytes(total_bytes)} across {len(features)} scene(s)", file=sys.stderr)
+
+    # Optional QA summary
+    if args.qa and args.qa_mode == "full":
+        try:
+            _write_qa(args, query_meta, features, place_info, total_bytes, elapsed)
+            if not _quiet():
+                print(f"[sentinel1-download] wrote QA summary to {args.qa}", file=sys.stderr)
+        except Exception as e:
+            print(f"ERROR: --qa write failed: {e}", file=sys.stderr)
+            return 3
+
     return 0 if overall_ok else 1
+
+
+def _write_qa(args, query_meta, features, place_info, total_bytes, elapsed):
+    """Write QA JSON to args.qa (called from search-only or full mode)."""
+    qa = {
+        "skill": "sentinel1-download",
+        "version": "0.2.0",
+        "query": {
+            "bbox": list(query_meta.get("bbox") or []),
+            "start_date": args.start_date,
+            "end_date": args.end_date,
+            "polarization": args.polarization,
+            "orbit_direction": args.orbit_direction,
+            "bands": args.bands,
+            "source": args.source,
+            "place": (
+                {
+                    "query": place_info.get("query") if place_info else None,
+                    "display_name": place_info.get("display_name") if place_info else None,
+                    "source": place_info.get("source") if place_info else None,
+                    "buffer_deg": place_info.get("buffer_deg_used") if place_info else None,
+                }
+                if place_info
+                else None
+            ),
+            "preset": getattr(args, "preset", None),
+            "year": getattr(args, "year", None),
+            "season": getattr(args, "season", None),
+            "pick_best": getattr(args, "pick_best", False),
+        },
+        "searched": len(features),
+        "picked": query_meta.get("picked"),
+        "downloaded": sum(1 for f in features if f.get("_ok", True)),
+        "failed": sum(1 for f in features if not f.get("_ok", True)),
+        "total_bytes": total_bytes,
+        "elapsed_seconds": round(elapsed, 1),
+        "scenes": [
+            {
+                "id": f.get("id"),
+                "datetime": f.get("properties", {}).get("datetime"),
+                "platform": f.get("properties", {}).get("platform"),
+                "orbit_direction": f.get("properties", {}).get("sat:orbit_state"),
+            }
+            for f in features
+        ],
+    }
+    with open(args.qa, "w", encoding="utf-8") as f:
+        json.dump(qa, f, ensure_ascii=False, indent=2)
 
 
 if __name__ == "__main__":

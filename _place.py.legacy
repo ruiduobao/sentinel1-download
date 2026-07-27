@@ -1,0 +1,322 @@
+"""Shared place-name → bbox resolver for batch4 skills.
+
+Lightweight geocoding using public APIs (no API key):
+- Open-Meteo geocoding API (primary, works in restricted networks)
+- OSM Nominatim (fallback, may be rate-limited)
+
+Privacy: HTTPS requests to public geocoding endpoints only. No PII, no
+local files sent. No telemetry.
+
+The bbox returned is a conservative ~5 km buffer around the centroid
+point. For sub-district level Chinese names, the resolver extracts the
+shortest Chinese match — e.g. "北京市朝阳区" → "朝阳区" → falls back to
+"北京市" when subdistrict isn't in the index.
+"""
+from __future__ import annotations
+
+import json
+import re
+import sys
+from typing import Dict, List, Optional
+
+import requests
+
+
+OPEN_METEO_GEOCODE = "https://geocoding-api.open-meteo.com/v1/search"
+NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+
+DEFAULT_TIMEOUT = 15
+DEFAULT_USER_AGENT = "codex-skill-batch4/1.0 (+https://clawhub.ai)"
+
+# ~5 km buffer at mid-latitudes. 1° lat ≈ 111 km, so 0.05° ≈ 5.5 km.
+DEFAULT_BUFFER_DEG = 0.05
+
+
+def _chinese_char_ratio(text: str) -> float:
+    if not text:
+        return 0.0
+    chinese = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff")
+    return chinese / max(1, len(text))
+
+
+def _strip_chinese_place_hierarchy(place: str) -> List[str]:
+    """Build candidate substrings ending with admin markers. Returned most
+    specific first. ``北京市朝阳区`` -> ['朝阳区', '北京市', '北京', '市朝阳区'].
+    """
+    out: List[str] = []
+    if not place:
+        return out
+    markers = ("市", "省", "自治区", "区", "县", "旗")
+    # For every marker occurrence, build the substring that ends at that marker
+    # and the substring that starts right after that marker (if any).
+    for i, ch in enumerate(place):
+        if ch in markers:
+            # The part ending with this marker (without the marker for the next try)
+            sub = place[: i + 1]
+            if sub not in out and sub != place:
+                out.append(sub)
+            # The part starting after this marker — likely a deeper level
+            tail = place[i + 1 :]
+            if tail and tail not in out and tail != place:
+                out.append(tail)
+    return out
+
+
+def _open_meteo_search(query: str, language: str, timeout: int, user_agent: str) -> List[Dict]:
+    try:
+        response = requests.get(
+            OPEN_METEO_GEOCODE,
+            params={"name": query, "count": 10, "language": language, "format": "json"},
+            headers={"User-Agent": user_agent},
+            timeout=timeout,
+        )
+        response.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        return [{"_error": f"open-meteo: {e}"}]
+    data = response.json() or {}
+    results = []
+    for r in data.get("results", []) or []:
+        results.append(
+            {
+                "name": r.get("name"),
+                "lat": float(r.get("latitude", 0.0)),
+                "lon": float(r.get("longitude", 0.0)),
+                "display_name": ", ".join(
+                    p for p in (
+                        r.get("name"),
+                        r.get("admin1"),
+                        r.get("admin2"),
+                        r.get("admin3"),
+                        r.get("country"),
+                    ) if p
+                ),
+                "country_code": (r.get("country_code") or "").lower(),
+                "feature_code": r.get("feature_code"),
+                "admin1": r.get("admin1"),
+                "admin2": r.get("admin2"),
+                "population": r.get("population"),
+                "source": "open-meteo",
+            }
+        )
+    return results
+
+
+def _nominatim_search(query: str, timeout: int, user_agent: str) -> List[Dict]:
+    try:
+        response = requests.get(
+            NOMINATIM_URL,
+            params={
+                "q": query,
+                "format": "jsonv2",
+                "limit": 5,
+                "addressdetails": 1,
+            },
+            headers={"User-Agent": user_agent, "Accept-Language": "zh-CN,zh;q=0.9"},
+            timeout=timeout,
+        )
+        response.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        return [{"_error": f"nominatim: {e}"}]
+    results = []
+    for r in response.json() or []:
+        bbox = r.get("boundingbox") or []
+        if len(bbox) != 4:
+            continue
+        try:
+            results.append(
+                {
+                    "name": r.get("name") or r.get("display_name", ""),
+                    "lat": float(r.get("lat", 0.0)),
+                    "lon": float(r.get("lon", 0.0)),
+                    "display_name": r.get("display_name", ""),
+                    "country_code": (r.get("address") or {}).get("country_code", ""),
+                    "bbox": [
+                        float(bbox[2]),
+                        float(bbox[0]),
+                        float(bbox[3]),
+                        float(bbox[1]),
+                    ],
+                    "osm_id": r.get("osm_id"),
+                    "osm_type": r.get("osm_type"),
+                    "source": "nominatim",
+                }
+            )
+        except (TypeError, ValueError):
+            continue
+    return results
+
+
+def _bbox_from_point(lat: float, lon: float, buffer_deg: float) -> List[float]:
+    return [
+        max(-180.0, lon - buffer_deg),
+        max(-90.0, lat - buffer_deg),
+        min(180.0, lon + buffer_deg),
+        min(90.0, lat + buffer_deg),
+    ]
+
+
+def _first_clean(candidates: List[Dict]) -> List[Dict]:
+    return [c for c in candidates if "_error" not in c]
+
+
+def _score_open_meteo(candidate: Dict, query: str) -> int:
+    name = (candidate.get("name") or "").replace(" ", "")
+    q = (query or "").replace(" ", "")
+    score = 0
+    if name == q:
+        score += 100
+    if q in name or name in q:
+        score += 30
+    pop = candidate.get("population") or 0
+    if pop > 1_000_000:
+        score += 10
+    elif pop > 100_000:
+        score += 5
+    cc = candidate.get("country_code", "")
+    if cc == "cn":
+        score += 20
+    return score
+
+
+def resolve_place(
+    place: str,
+    timeout: int = DEFAULT_TIMEOUT,
+    user_agent: str = DEFAULT_USER_AGENT,
+    prefer_country: str = "cn",
+    buffer_deg: float = DEFAULT_BUFFER_DEG,
+    allow_nominatim: bool = True,
+) -> Dict:
+    """Resolve a place name to a bbox (WGS84) plus display metadata.
+
+    Returns
+    -------
+    dict
+        ``{query, normalised_query, display_name, name, lat, lon, bbox,
+        osm_id, osm_type, country_code, source, candidates}``
+    """
+    if not place or not place.strip():
+        raise ValueError("--place must not be empty")
+    normalised = re.sub(r"\s+", "", place.strip())
+    is_chinese = _chinese_char_ratio(normalised) > 0.4
+    language = "zh" if is_chinese else "en"
+
+    queries_to_try: List[str] = []
+    queries_to_try.append(normalised)
+    if is_chinese:
+        # Open-Meteo has "北京" but not "北京市"; "成都" but not "成都市"
+        # Strip a single trailing admin suffix (市/省/自治区/区/县/旗) to
+        # produce an additional candidate.
+        if normalised and normalised[-1] in "市省区县旗":
+            stripped = normalised[:-1]
+        else:
+            stripped = ""
+        if stripped and stripped != normalised and stripped not in queries_to_try:
+            queries_to_try.append(stripped)
+        # Try the most specific sub-region first
+        candidates = _strip_chinese_place_hierarchy(normalised)
+        for c in reversed(candidates):
+            if c and c not in queries_to_try:
+                queries_to_try.append(c)
+            if c and c[-1] in "市省区县旗":
+                cs = c[:-1]
+                if cs and cs != c and cs not in queries_to_try:
+                    queries_to_try.append(cs)
+    if not is_chinese and place.strip() != normalised:
+        queries_to_try.append(place.strip())
+
+    last_error = "no candidates"
+    chosen: Optional[Dict] = None
+    all_candidates: List[Dict] = []
+    for q in queries_to_try:
+        primary = _first_clean(_open_meteo_search(q, language, timeout, user_agent))
+        if not primary:
+            continue
+        if prefer_country:
+            cc_matches = [c for c in primary if c.get("country_code") == prefer_country]
+            if cc_matches:
+                primary = cc_matches
+        for c in primary[:5]:
+            c = dict(c)
+            c["source_query"] = q
+            all_candidates.append(c)
+
+    if not all_candidates:
+        raise ValueError(
+            f"Could not resolve place {place!r} via Open-Meteo. "
+            "Try a more general name (city instead of district) or pass --bbox explicitly."
+        )
+
+    def score_with_context(c: Dict) -> int:
+        base = _score_open_meteo(c, normalised)
+        display = c.get("display_name", "")
+        if "北京市" in normalised and "北京" in display:
+            base += 200
+        elif "上海市" in normalised and "上海" in display:
+            base += 200
+        elif "广州市" in normalised and "广州" in display:
+            base += 200
+        elif "深圳市" in normalised and "深圳" in display:
+            base += 200
+        elif "重庆市" in normalised and "重庆" in display:
+            base += 200
+        else:
+            for prefix in (
+                "北京", "上海", "广州", "深圳", "重庆", "成都", "杭州",
+                "南京", "武汉", "西安", "天津", "苏州", "郑州", "青岛", "济南",
+            ):
+                if normalised.startswith(prefix) and prefix in display:
+                    base += 100
+                    break
+        return base
+
+    all_candidates.sort(key=score_with_context, reverse=True)
+    chosen = all_candidates[0]
+    bbox = _bbox_from_point(chosen["lat"], chosen["lon"], buffer_deg)
+
+    # Optionally enrich with a Nominatim bbox if reachable.
+    if allow_nominatim:
+        nom = _first_clean(_nominatim_search(normalised, timeout, user_agent))
+        if nom and prefer_country:
+            nom = [c for c in nom if c.get("country_code") == prefer_country] or nom
+        if nom:
+            nom_chosen = nom[0]
+            bbox = nom_chosen["bbox"]
+            return {
+                "query": place,
+                "normalised_query": normalised,
+                "display_name": nom_chosen.get("display_name", ""),
+                "name": nom_chosen.get("name", place),
+                "lat": nom_chosen["lat"],
+                "lon": nom_chosen["lon"],
+                "bbox": bbox,
+                "osm_id": nom_chosen.get("osm_id"),
+                "osm_type": nom_chosen.get("osm_type"),
+                "country_code": nom_chosen.get("country_code", ""),
+                "source": "nominatim",
+                "candidates": all_candidates[:5] or nom[:5],
+            }
+
+    return {
+        "query": place,
+        "normalised_query": normalised,
+        "display_name": chosen.get("display_name", ""),
+        "name": chosen.get("name", place),
+        "lat": chosen["lat"],
+        "lon": chosen["lon"],
+        "bbox": bbox,
+        "osm_id": None,
+        "osm_type": None,
+        "country_code": chosen.get("country_code", ""),
+        "source": "open-meteo",
+        "candidates": all_candidates[:5],
+    }
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: python _place_resolver.py <place name> [--no-nominatim]")
+        raise SystemExit(2)
+    use_nominatim = "--no-nominatim" not in sys.argv
+    place = next(a for a in sys.argv[1:] if not a.startswith("--"))
+    res = resolve_place(place, allow_nominatim=use_nominatim)
+    print(json.dumps(res, ensure_ascii=False, indent=2))
